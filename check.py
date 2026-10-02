@@ -26,7 +26,8 @@ import smtplib
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from urllib.parse import urlencode
@@ -130,49 +131,87 @@ def fetch_json_requests(session: requests.Session, url: str) -> dict | None:
     return None
 
 
-_browser = None
+_pw = None
+_browser = None     # Browser object
+_page = None        # page with Apple cookies, reused across lookups
+_mode = None        # "headless" or "windowed"
+
+
+def _open_browser(headless: bool):
+    """Launch Chrome and load Apple's store page so its scripts set cookies."""
+    global _pw
+    from playwright.sync_api import sync_playwright
+    if _pw is None:
+        _pw = sync_playwright().start()
+    # Apple rejects (HTTP 541) browsers that expose navigator.webdriver.
+    args = ["--disable-blink-features=AutomationControlled"]
+    if not headless:
+        args.append("--window-position=-32000,-32000")  # real window, off-screen
+    kw = {"headless": headless, "args": args}
+    try:
+        b = _pw.chromium.launch(channel="chrome", **kw)   # real Google Chrome
+    except Exception:
+        b = _pw.chromium.launch(**kw)                     # Playwright's Chromium
+    ctx_kw = {"locale": "en-US"}
+    if headless:  # use the browser's own UA, minus "Headless"
+        probe = b.new_page()
+        ctx_kw["user_agent"] = probe.evaluate("navigator.userAgent").replace("HeadlessChrome", "Chrome")
+        probe.close()
+    page = b.new_context(**ctx_kw).new_page()
+    r = page.goto(f"{BASE}/shop/buy-iphone", wait_until="load", timeout=60000)
+    page.wait_for_timeout(5000)  # let Apple's bot-check scripts finish
+    mode = "headless" if headless else "windowed"
+    print(f"  browser fallback v3 ({mode}): Chrome {b.version}, store page HTTP "
+          f"{r.status if r else '?'}", file=sys.stderr)
+    return b, page, mode
+
+
+def _page_fetch(page, url: str) -> dict:
+    """Apple's bot check needs a few seconds after page load before it lets
+    requests through (they get 541 until then), so retry with waits and
+    reload the store page once if still blocked."""
+    res = {"status": "?"}
+    for attempt in range(6):
+        res = page.evaluate(
+            """async (u) => { const r = await fetch(u, {headers:{Accept:'application/json'}});
+                              return {status: r.status, body: await r.text()}; }""",
+            url,
+        )
+        if res["status"] == 200:
+            return res
+        if attempt == 2:
+            page.goto(f"{BASE}/shop/buy-iphone", wait_until="load", timeout=60000)
+        page.wait_for_timeout(4000)
+    return res
 
 
 def fetch_json_browser(url: str) -> dict | None:
-    """Fallback: run the fetch inside a real (headless) Chromium page."""
-    global _browser
+    """Fallback: fetch inside a real Chrome page. Tries a normal Chrome window
+    (placed off-screen) first, which Apple accepts most reliably, then headless.
+    Force a mode with env BROWSER_MODE=headless or BROWSER_MODE=windowed."""
+    global _browser, _page, _mode
     try:
-        from playwright.sync_api import sync_playwright
+        import playwright  # noqa: F401
     except ImportError:
         print("  playwright not installed; skipping browser fallback", file=sys.stderr)
         return None
-    if _browser is None:
-        pw = sync_playwright().start()
-        # Apple rejects (HTTP 541) browsers that expose navigator.webdriver, so
-        # hide the automation flag. Prefer real Google Chrome when installed
-        # (it is on GitHub's ubuntu runners), else Playwright's Chromium.
-        launch_args = {"headless": True,
-                       "args": ["--disable-blink-features=AutomationControlled"]}
-        try:
-            b = pw.chromium.launch(channel="chrome", **launch_args)
-        except Exception:
-            b = pw.chromium.launch(**launch_args)
-        # Use the browser's own UA (matching OS/version), minus "Headless".
-        probe = b.new_page()
-        ua = probe.evaluate("navigator.userAgent").replace("HeadlessChrome", "Chrome")
-        probe.close()
-        print(f"  browser fallback v2: {b.browser_type.name} {b.version}", file=sys.stderr)
-        ctx = b.new_context(user_agent=ua, locale="en-US")
-        page = ctx.new_page()
-        page.goto(f"{BASE}/shop/buy-iphone", wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)  # let Apple's page scripts set cookies
-        _browser = page
-    res = _browser.evaluate(
-        """async (u) => { const r = await fetch(u, {headers:{Accept:'application/json'}});
-                          return {status: r.status, body: await r.text()}; }""",
-        url,
-    )
-    if res["status"] == 200:
-        try:
-            return json.loads(res["body"])
-        except ValueError:
-            pass
-    print(f"  browser fetch failed (HTTP {res['status']})", file=sys.stderr)
+    forced = os.getenv("BROWSER_MODE", "").strip().lower()
+    modes = [forced] if forced in ("headless", "windowed") else ["windowed", "headless"]
+    if _mode in modes:  # resume from the mode that last worked
+        modes = modes[modes.index(_mode):]
+    res = {"status": "?"}
+    for mode in modes:
+        if _mode != mode:
+            if _browser is not None:
+                _browser.close()
+            _browser, _page, _mode = _open_browser(headless=(mode == "headless"))
+        res = _page_fetch(_page, url)
+        if res["status"] == 200:
+            try:
+                return json.loads(res["body"])
+            except ValueError:
+                pass
+        print(f"  browser fetch failed ({mode}, HTTP {res['status']})", file=sys.stderr)
     return None
 
 
@@ -217,11 +256,14 @@ def parse_stores(data: dict, parts: list[str], radius: float) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Notifications
 # --------------------------------------------------------------------------- #
-def send_email(subject: str, body: str) -> None:
+def send_email(subject: str, body: str, html: str | None = None) -> None:
     host, user, pw, to = (os.getenv(k) for k in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "EMAIL_TO"))
     if not all((host, user, pw, to)):
         return
-    msg = MIMEText(body, "plain", "utf-8")
+    msg = MIMEMultipart("alternative")
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+    if html:
+        msg.attach(MIMEText(html, "html", "utf-8"))
     msg["Subject"], msg["From"], msg["To"] = subject, user, to
     with smtplib.SMTP(host, int(os.getenv("SMTP_PORT", "587")), timeout=30) as s:
         s.starttls()
@@ -250,8 +292,8 @@ def send_twilio(text: str) -> None:
     print(f"  twilio whatsapp: HTTP {r.status_code}")
 
 
-def notify(subject: str, body: str) -> None:
-    for fn, args in ((send_email, (subject, body)),
+def notify(subject: str, body: str, html: str | None = None) -> None:
+    for fn, args in ((send_email, (subject, body, html)),
                      (send_callmebot, (f"{subject}\n\n{body}",)),
                      (send_twilio, (f"{subject}\n\n{body}",))):
         try:
@@ -288,6 +330,7 @@ def run(cfg: dict, dry_run: bool) -> int:
         print(f"{label} -> {part} ({cp})")
 
     rows: list[dict] = []
+    failed: set[tuple[str, str]] = set()          # (zip, part) lookups that failed
     for z in zips:
         for cp, parts in by_carrier.items():
             url = build_url(parts, z, cp)
@@ -295,44 +338,143 @@ def run(cfg: dict, dry_run: bool) -> int:
             data = fetch_json_requests(session, url) or fetch_json_browser(url)
             if data is None:
                 errors.append(f"Apple blocked/failed lookup for ZIP {z} ({cp})")
+                failed.update((z, p) for p in parts)
                 continue
             for r in parse_stores(data, parts, radius):
                 r["zip"] = z
                 rows.append(r)
             time.sleep(2)  # be polite
 
-    available = [r for r in rows if r["available"]]
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    lines = [f"Checked at {now} | ZIPs: {', '.join(zips)} | radius {radius:g} mi", ""]
-    for part, label in labels.items():
-        lines.append(f"== {label} ({part})")
-        hits = [r for r in rows if r["part"] == part]
-        if not hits:
-            lines.append("   No Apple Store within radius returned data.")
-        for r in sorted(hits, key=lambda x: (not x["available"], x["distance"] or 999)):
-            mark = "AVAILABLE" if r["available"] else "not available"
-            dist = f"{r['distance']:.1f} mi" if r["distance"] is not None else "? mi"
-            lines.append(f"   [{mark}] {r['store']}, {r['city']} {r['state']} - {dist} "
-                         f"(ZIP {r['zip']}) {r['quote']}".rstrip())
-        lines.append("")
-    if errors:
-        lines += ["Errors:"] + [f"   - {e}" for e in errors]
-    lines.append("Buy: https://www.apple.com/shop/buy-iphone")
-    body = "\n".join(lines)
-
-    if available:
-        uniq = {(r["part"], r["store"]) for r in available}
-        subject = f"✅ iPhone AVAILABLE for pickup ({len(uniq)} store/config match)"
-    elif errors and not rows:
+    summary = build_summary(labels, zips, rows, failed)
+    n_avail = sum(1 for d in summary for z in d["zips"] if z["status"] == "available")
+    all_failed = bool(errors) and not rows
+    if n_avail:
+        subject = f"✅ iPhone AVAILABLE near {n_avail} ZIP/model combo{'s' if n_avail > 1 else ''}"
+    elif all_failed:
         subject = "⚠️ iPhone availability check FAILED"
     else:
-        subject = "❌ iPhone not available near you"
+        subject = "❌ iPhone not available near your ZIPs"
 
-    print("\n" + subject + "\n" + body)
+    checked_at = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+    text = render_text(summary, checked_at, radius, errors)
+    html = render_html(subject, summary, checked_at, radius, errors)
+    print("\n" + subject + "\n" + text)
     if not dry_run:
-        notify(subject, body)
-    return 1 if (errors and not rows) else 0
+        notify(subject, text, html)
+    return 1 if all_failed else 0
+
+
+# --------------------------------------------------------------------------- #
+# Report formatting (one status per model per ZIP; only available stores listed)
+# --------------------------------------------------------------------------- #
+IST = timezone(timedelta(hours=5, minutes=30))
+BUY_URL = "https://www.apple.com/shop/buy-iphone"
+MAX_STORES = 3  # nearest available stores listed per ZIP; the rest are counted
+
+
+def build_summary(labels: dict, zips: list[str], rows: list[dict], failed: set) -> list[dict]:
+    out = []
+    for part, label in labels.items():
+        zs = []
+        for z in zips:
+            hits = [r for r in rows if r["part"] == part and r["zip"] == z]
+            stores = sorted((r for r in hits if r["available"]),
+                            key=lambda r: r["distance"] if r["distance"] is not None else 999)
+            if stores:
+                status = "available"
+            elif (z, part) in failed:
+                status = "failed"
+            elif hits:
+                status = "unavailable"
+            else:
+                status = "nostores"
+            zs.append({"zip": z, "status": status, "stores": stores})
+        out.append({"label": label, "part": part, "zips": zs})
+    return out
+
+
+STATUS_TEXT = {
+    "unavailable": "Not available",
+    "failed": "Check failed (Apple blocked the lookup)",
+    "nostores": "No Apple Store within radius",
+}
+
+
+def _store_line(r: dict) -> str:
+    dist = f"{r['distance']:.1f} mi" if r["distance"] is not None else "? mi"
+    return f"{r['store']}, {r['city']} {r['state']} ({dist})"
+
+
+def render_text(summary: list[dict], checked_at: str, radius: float, errors: list[str]) -> str:
+    lines = [f"Checked {checked_at} | within {radius:g} miles", ""]
+    for d in summary:
+        lines.append(d["label"])
+        for z in d["zips"]:
+            if z["status"] == "available":
+                lines.append(f"  ZIP {z['zip']}: AVAILABLE at {len(z['stores'])} store(s)")
+                lines += [f"    - {_store_line(r)}" for r in z["stores"][:MAX_STORES]]
+                if len(z["stores"]) > MAX_STORES:
+                    lines.append(f"    + {len(z['stores']) - MAX_STORES} more")
+            else:
+                lines.append(f"  ZIP {z['zip']}: {STATUS_TEXT[z['status']]}")
+        lines.append("")
+    if errors and not any(z["status"] == "failed" for d in summary for z in d["zips"]):
+        lines += ["Notes:"] + [f"  - {e}" for e in errors] + [""]
+    lines.append(f"Buy: {BUY_URL}")
+    return "\n".join(lines)
+
+
+def render_html(subject: str, summary: list[dict], checked_at: str, radius: float,
+                errors: list[str]) -> str:
+    from html import escape as e
+    badge = {
+        "available": ("#e6f4ea", "#137333", "Available"),
+        "unavailable": ("#f1f3f4", "#5f6368", "Not available"),
+        "failed": ("#fef7e0", "#b06000", "Check failed"),
+        "nostores": ("#f1f3f4", "#5f6368", "No store nearby"),
+    }
+    cards = []
+    for d in summary:
+        rows_html = []
+        for z in d["zips"]:
+            bg, fg, txt = badge[z["status"]]
+            if z["status"] == "available":
+                txt = f"Available at {len(z['stores'])} store{'s' if len(z['stores']) > 1 else ''}"
+            detail = ""
+            if z["stores"]:
+                detail = "".join(
+                    f'<div style="font-size:13px;color:#3c4043;margin-top:4px">• {e(_store_line(r))}</div>'
+                    for r in z["stores"][:MAX_STORES])
+                if len(z["stores"]) > MAX_STORES:
+                    detail += (f'<div style="font-size:13px;color:#80868b;margin-top:4px">'
+                               f'+ {len(z["stores"]) - MAX_STORES} more</div>')
+            rows_html.append(
+                f'<tr><td style="padding:10px 12px;border-top:1px solid #eee;width:90px;'
+                f'font-weight:600;color:#202124;vertical-align:top">ZIP {e(z["zip"])}</td>'
+                f'<td style="padding:10px 12px;border-top:1px solid #eee">'
+                f'<span style="display:inline-block;padding:3px 10px;border-radius:12px;'
+                f'background:{bg};color:{fg};font-size:13px;font-weight:600">{e(txt)}</span>'
+                f'{detail}</td></tr>')
+        cards.append(
+            f'<div style="border:1px solid #dadce0;border-radius:10px;margin:0 0 16px;overflow:hidden">'
+            f'<div style="padding:12px;background:#f8f9fa;font-weight:600;font-size:15px;color:#202124">'
+            f'{e(d["label"])} <span style="color:#80868b;font-weight:400;font-size:12px">'
+            f'{e(d["part"])}</span></div>'
+            f'<table style="width:100%;border-collapse:collapse">{"".join(rows_html)}</table></div>')
+    note = ""
+    if errors and not any(z["status"] == "failed" for d in summary for z in d["zips"]):
+        note = ('<div style="font-size:12px;color:#b06000;margin-top:8px">'
+                + "<br>".join(e(x) for x in errors) + "</div>")
+    return (
+        '<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;'
+        'max-width:600px;margin:0 auto;padding:16px">'
+        f'<h2 style="margin:0 0 4px;font-size:20px;color:#202124">{e(subject)}</h2>'
+        f'<div style="color:#5f6368;font-size:13px;margin-bottom:16px">'
+        f'Checked {e(checked_at)} &middot; within {radius:g} miles</div>'
+        f'{"".join(cards)}{note}'
+        f'<a href="{BUY_URL}" style="display:inline-block;margin-top:8px;padding:10px 18px;'
+        'background:#0071e3;color:#fff;text-decoration:none;border-radius:18px;font-size:14px">'
+        'Open Apple Store</a></div>')
 
 
 def list_configs(model: str) -> None:
@@ -340,7 +482,21 @@ def list_configs(model: str) -> None:
         print(f"{p['partNumber']:12} {p['name']}")
 
 
+def load_env_file(path: Path) -> None:
+    """Load KEY=VALUE lines from a local .env file (for running on your own PC).
+    Real environment variables (e.g. GitHub Secrets) take precedence."""
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
 def main() -> None:
+    load_env_file(Path(__file__).with_name(".env"))
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=str(Path(__file__).with_name("config.json")))
     ap.add_argument("--dry-run", action="store_true")
