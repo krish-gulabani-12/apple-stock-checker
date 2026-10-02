@@ -156,6 +156,7 @@ def fetch_json_browser(url: str) -> dict | None:
         probe = b.new_page()
         ua = probe.evaluate("navigator.userAgent").replace("HeadlessChrome", "Chrome")
         probe.close()
+        print(f"  browser fallback v2: {b.browser_type.name} {b.version}", file=sys.stderr)
         ctx = b.new_context(user_agent=ua, locale="en-US")
         page = ctx.new_page()
         page.goto(f"{BASE}/shop/buy-iphone", wait_until="domcontentloaded", timeout=60000)
