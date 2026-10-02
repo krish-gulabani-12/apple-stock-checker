@@ -1,8 +1,8 @@
 {
-  "zips": ["10001", "44114", "22031"],
+  "zips": ["44114", "22031"],
   "radius_miles": 20,
   "devices": [
-    { "model": "iPhone 18 Pro", "color": "Silver", "storage": "256GB", "carrier": "Unlocked" },
+    { "model": "iPhone 18 Pro Max", "color": "Silver", "storage": "256GB", "carrier": "Unlocked" },
     { "model": "iPhone 18 Pro Max", "color": "Black", "storage": "256GB", "carrier": "Unlocked" }
   ]
 }
