@@ -143,10 +143,23 @@ def fetch_json_browser(url: str) -> dict | None:
         return None
     if _browser is None:
         pw = sync_playwright().start()
-        b = pw.chromium.launch(headless=True)
-        ctx = b.new_context(user_agent=UA, locale="en-US")
+        # Apple rejects (HTTP 541) browsers that expose navigator.webdriver, so
+        # hide the automation flag. Prefer real Google Chrome when installed
+        # (it is on GitHub's ubuntu runners), else Playwright's Chromium.
+        launch_args = {"headless": True,
+                       "args": ["--disable-blink-features=AutomationControlled"]}
+        try:
+            b = pw.chromium.launch(channel="chrome", **launch_args)
+        except Exception:
+            b = pw.chromium.launch(**launch_args)
+        # Use the browser's own UA (matching OS/version), minus "Headless".
+        probe = b.new_page()
+        ua = probe.evaluate("navigator.userAgent").replace("HeadlessChrome", "Chrome")
+        probe.close()
+        ctx = b.new_context(user_agent=ua, locale="en-US")
         page = ctx.new_page()
         page.goto(f"{BASE}/shop/buy-iphone", wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(3000)  # let Apple's page scripts set cookies
         _browser = page
     res = _browser.evaluate(
         """async (u) => { const r = await fetch(u, {headers:{Accept:'application/json'}});
